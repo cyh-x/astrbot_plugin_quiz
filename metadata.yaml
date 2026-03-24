@@ -1,6 +1,6 @@
 name: astrbot_plugin_quiz
 display_name: Quiz
-desc: 一个基于FoxQuiz网站的知识问答插件
+desc:一个基于 FoxQuiz 网站的知识问答插件，适用于 AstrBot 框架。\n支持多种题库类型（如 naruto, marvel, bleach 等），可下载题库、进行问答游戏，并记录用户的累计奖金和最高纪录。
 version: 1.0.0
 author: cyh-x
 repo: https://github.com/cyh-x/astrbot_plugin_quiz
