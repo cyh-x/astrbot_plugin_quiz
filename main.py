@@ -126,7 +126,9 @@ async def download_and_parse_quiz(
 BASE_URL = "https://foxquiz.com"
 
 
-async def download_images(quiz_type: str, data_dir: Path, output_dir: Optional[Path] = None):
+async def download_images(
+    quiz_type: str, data_dir: Path, output_dir: Optional[Path] = None
+):
     """
     异步下载指定测验类型的所有图片。
     """
@@ -349,7 +351,11 @@ def get_user_all_stats(data_root: Path, user_id: str) -> Dict[str, Dict[str, int
     user_data = data["users"].get(user_id, {})
     stats_dict = {}
     for key, value in user_data.items():
-        if isinstance(value, dict) and "total_money" in value and "highest_record" in value:
+        if (
+            isinstance(value, dict)
+            and "total_money" in value
+            and "highest_record" in value
+        ):
             stats_dict[key] = value
     return stats_dict
 
@@ -360,7 +366,11 @@ def get_all_users_stats(data_root: Path) -> Dict[str, Dict[str, Dict[str, int]]]
     for uid, user_data in data["users"].items():
         stats_dict = {}
         for key, value in user_data.items():
-            if isinstance(value, dict) and "total_money" in value and "highest_record" in value:
+            if (
+                isinstance(value, dict)
+                and "total_money" in value
+                and "highest_record" in value
+            ):
                 stats_dict[key] = value
         if stats_dict:
             all_stats[uid] = stats_dict
@@ -438,7 +448,9 @@ class MyPlugin(Star):
         chapter = 0
 
         file_path = self.data_dir / f"{type_of_quiz}_quiz.json"
-        total_money, highest_record = get_user_stats(self.data_dir, user_id, type_of_quiz)
+        total_money, highest_record = get_user_stats(
+            self.data_dir, user_id, type_of_quiz
+        )
 
         yield event.plain_result(
             f"欢迎{user_name}参加{type_of_quiz}个人问答挑战，共10题，每道题目奖金依次升高。但如果答错题目，奖金将清零！\n"
@@ -465,7 +477,11 @@ class MyPlugin(Star):
             return
 
         # 发送第一题
-        img_path = self.data_dir / f"{type_of_quiz}_quiz_images" / f"{random_questions[0]['id']}.png"
+        img_path = (
+            self.data_dir
+            / f"{type_of_quiz}_quiz_images"
+            / f"{random_questions[0]['id']}.png"
+        )
         text_content = f"请在15秒内回答第1题：{random_questions[0]['question']}\n{random_questions[0]['options']}"
         if img_path.exists():
             chain = [Comp.Plain(text_content), Comp.Image.fromFileSystem(str(img_path))]
@@ -475,7 +491,9 @@ class MyPlugin(Star):
             yield event.plain_result(text_content)
 
         @session_waiter(timeout=15, record_history_chains=False)
-        async def empty_mention_waiter(controller: SessionController, event: AstrMessageEvent):
+        async def empty_mention_waiter(
+            controller: SessionController, event: AstrMessageEvent
+        ):
             if not event.message_str or event.message_str.strip() == "":
                 logger.debug("收到空消息，忽略并继续等待")
                 controller.keep(timeout=15, reset_timeout=True)  # 继续等待
@@ -502,9 +520,16 @@ class MyPlugin(Star):
                     try:
                         next_q = random_questions[quiz_turn]
                         text_content = f"第{quiz_turn + 1}题：{next_q['question']}\n{next_q['options']}"
-                        img_path = self.data_dir / f"{type_of_quiz}_quiz_images" / f"{next_q['id']}.png"
+                        img_path = (
+                            self.data_dir
+                            / f"{type_of_quiz}_quiz_images"
+                            / f"{next_q['id']}.png"
+                        )
                         if img_path.exists():
-                            chain = [Comp.Plain(text_content), Comp.Image.fromFileSystem(str(img_path))]
+                            chain = [
+                                Comp.Plain(text_content),
+                                Comp.Image.fromFileSystem(str(img_path)),
+                            ]
                             await event.send(event.chain_result(chain))
                         else:
                             logger.warning(f"图片不存在: {img_path}")
@@ -530,7 +555,7 @@ class MyPlugin(Star):
                                 f"该类型累计总奖金：{new_total} 元，{type_of_quiz} 类型最高纪录：{new_highest} 元。"
                             )
                         )
-                        chapter=0
+                        chapter = 0
                         controller.stop()
                         return
                     else:
@@ -553,10 +578,11 @@ class MyPlugin(Star):
                             f"您的该类型累计总奖金：{new_total} 元，{type_of_quiz} 类型最高纪录：{new_highest} 元。再接再厉！"
                         )
                     )
-                    chapter=0
+                    chapter = 0
                     controller.stop()
                     return
-        chapter=0
+
+        chapter = 0
         try:
             await empty_mention_waiter(event)
         except TimeoutError:
