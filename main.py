@@ -476,6 +476,10 @@ class MyPlugin(Star):
 
         @session_waiter(timeout=15, record_history_chains=False)
         async def empty_mention_waiter(controller: SessionController, event: AstrMessageEvent):
+            if not event.message_str or event.message_str.strip() == "":
+                logger.debug("收到空消息，忽略并继续等待")
+                controller.keep(timeout=15, reset_timeout=True)  # 继续等待
+                return
             nonlocal quiz_turn, money, chapter
             current_q = random_questions[quiz_turn]
             answer = event.message_str
@@ -526,6 +530,7 @@ class MyPlugin(Star):
                                 f"该类型累计总奖金：{new_total} 元，{type_of_quiz} 类型最高纪录：{new_highest} 元。"
                             )
                         )
+                        chapter=0
                         controller.stop()
                         return
                     else:
@@ -548,9 +553,10 @@ class MyPlugin(Star):
                             f"您的该类型累计总奖金：{new_total} 元，{type_of_quiz} 类型最高纪录：{new_highest} 元。再接再厉！"
                         )
                     )
+                    chapter=0
                     controller.stop()
                     return
-
+        chapter=0
         try:
             await empty_mention_waiter(event)
         except TimeoutError:
