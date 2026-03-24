@@ -1,0 +1,21 @@
+name: astrbot_plugin_quiz
+display_name: Quiz
+desc: 一个基于FoxQuiz网站的知识问答插件
+version: 1.0.0
+author: cyh-x
+repo: https://github.com/cyh-x/astrbot_plugin_quiz
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - aiocqhttp
+  - telegram
+  - discord
+  - wecom
+  - lark
+  - dingtalk
+  - slack
+  - kook
+  - vocechat
+  - weixin_official_accounts
+  - satori
+  - misskey
+  - line
