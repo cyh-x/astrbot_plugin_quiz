@@ -19,6 +19,9 @@ import shutil
 from typing import Dict, Tuple, Optional
 from pathlib import Path
 
+# 在文件顶部（例如 import 之后）添加
+_user_data_lock = asyncio.Lock()
+
 
 async def download_and_parse_quiz(
     quiz_type: str,
@@ -105,7 +108,7 @@ async def download_and_parse_quiz(
             if "bg-green-50" in classes and opt.select_one("svg.lucide-check"):
                 correct_letter = letter
 
-        image_path = f"{idx}.png"
+        image_path = f"{number}.png"
         quiz_data.append(
             {
                 "id": idx,
@@ -126,11 +129,28 @@ async def download_and_parse_quiz(
 BASE_URL = "https://foxquiz.com"
 
 
+async def _download_single_image(
+    session: aiohttp.ClientSession, url: str, filepath: Path, headers: Dict[str, str]
+) -> None:
+    """下载单张图片，异常已捕获，不会抛出"""
+    try:
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+        ) as resp:
+            resp.raise_for_status()
+            img_data = await resp.read()
+        with open(filepath, "wb") as f:
+            f.write(img_data)
+        logger.debug(f"已下载: {filepath.name}")
+    except Exception as e:
+        logger.error(f"下载失败 {filepath.name}: {e}")
+
+
 async def download_images(
     quiz_type: str, data_dir: Path, output_dir: Optional[Path] = None
-):
+) -> None:
     """
-    异步下载指定测验类型的所有图片。
+    异步并发下载指定测验类型的所有图片。
     """
     html_file = data_dir / f"{quiz_type}_quiz.html"
     if output_dir is None:
@@ -167,6 +187,7 @@ async def download_images(
     )
 
     async with aiohttp.ClientSession() as session:
+        tasks = []
         for card in cards:
             # 提取序号
             title_div = card.find(
@@ -176,7 +197,10 @@ async def download_images(
                 continue
             number_span = title_div.find(
                 "span",
-                class_="inline-flex items-center justify-center w-8 h-8 mr-3 rounded-full bg-gray-100 text-gray-700 text-sm font-semibold leading-none",
+                class_=(
+                    "inline-flex items-center justify-center w-8 h-8 mr-3 "
+                    "rounded-full bg-gray-100 text-gray-700 text-sm font-semibold leading-none"
+                ),
             )
             if not number_span:
                 continue
@@ -185,7 +209,10 @@ async def download_images(
             # 提取图片元素
             img_div = card.find(
                 "div",
-                class_="relative w-full h-64 md:h-auto md:flex-1 md:min-h-[400px] bg-gray-100 order-1 md:order-2 border-b md:border-b-0 md:border-l border-gray-200",
+                class_=(
+                    "relative w-full h-64 md:h-auto md:flex-1 md:min-h-[400px] "
+                    "bg-gray-100 order-1 md:order-2 border-b md:border-b-0 md:border-l border-gray-200"
+                ),
             )
             if not img_div:
                 continue
@@ -226,19 +253,13 @@ async def download_images(
                 logger.info(f"图片 {filename} 已存在，跳过")
                 continue
 
-            try:
-                async with session.get(
-                    full_img_url,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as img_response:
-                    img_response.raise_for_status()
-                    img_data = await img_response.read()
-                with open(filepath, "wb") as f:
-                    f.write(img_data)
-                logger.info(f"已下载: {filename} ({full_img_url})")
-            except Exception as e:
-                logger.error(f"下载失败 {filename}: {e}")
+            # 创建下载任务（协程），不立即 await
+            task = _download_single_image(session, full_img_url, filepath, headers)
+            tasks.append(task)
+
+        # 并发执行所有下载任务
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def extract_random_questions(json_file_path: Path, num: int = 10):
@@ -260,6 +281,12 @@ def extract_random_questions(json_file_path: Path, num: int = 10):
             for i in range(start, end):
                 prefix = ">>> " if i == e.lineno - 1 else "    "
                 logger.error(prefix + lines[i].rstrip())
+        raise
+    except OSError as e:  # 新增：捕获文件读取错误
+        logger.error(f"读取文件失败: {e}")
+        raise RuntimeError(f"无法读取题库文件：{e}") from e
+    except Exception as e:  # 新增：兜底其他未知错误
+        logger.error(f"未知错误: {e}")
         raise
 
     if not isinstance(questions, list):
@@ -288,7 +315,7 @@ def extract_random_questions(json_file_path: Path, num: int = 10):
     return result
 
 
-def _load_user_data(data_root: Path) -> Dict:
+async def _load_user_data(data_root: Path) -> Dict:
     file_path = data_root / "user_data.json"
     if not file_path.exists():
         return {"users": {}}
@@ -299,71 +326,63 @@ def _load_user_data(data_root: Path) -> Dict:
         return {"users": {}}
 
 
-def _save_user_data(data_root: Path, data: Dict) -> None:
+async def _save_user_data(data_root: Path, data: Dict) -> None:
     file_path = data_root / "user_data.json"
     file_path.parent.mkdir(parents=True, exist_ok=True)
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def update_user_money(
+async def update_user_money(
     data_root: Path,
     user_id: str,
     user_name: str,
     quiz_type: str,
     current_game_money: int,
 ) -> Tuple[int, int]:
-    try:
-        data = _load_user_data(data_root)
-        if user_id not in data["users"]:
-            data["users"][user_id] = {}
-        user = data["users"][user_id]
+    async with _user_data_lock:
+        try:
+            data = await _load_user_data(data_root)
+            if user_id not in data["users"]:
+                data["users"][user_id] = {}
+            user = data["users"][user_id]
 
-        user["name"] = user_name
+            user["name"] = user_name
 
-        if quiz_type not in user:
-            user[quiz_type] = {"total_money": 0, "highest_record": 0}
+            if quiz_type not in user:
+                user[quiz_type] = {"total_money": 0, "highest_record": 0}
 
-        stats = user[quiz_type]
-        stats["total_money"] += current_game_money
-        if current_game_money > stats["highest_record"]:
-            stats["highest_record"] = current_game_money
+            stats = user[quiz_type]
+            stats["total_money"] += current_game_money
+            if current_game_money > stats["highest_record"]:
+                stats["highest_record"] = current_game_money
 
-        _save_user_data(data_root, data)
+            await _save_user_data(data_root, data)
+            return stats["total_money"], stats["highest_record"]
+        except Exception as e:
+            logger.error(
+                f"更新用户数据失败: {e}\n"
+                f"user_id={user_id}, quiz_type={quiz_type}, current_game_money={current_game_money}"
+            )
+            return 0, 0
+
+
+async def get_user_stats(
+    data_root: Path, user_id: str, quiz_type: str
+) -> Tuple[int, int]:
+    async with _user_data_lock:
+        data = await _load_user_data(data_root)
+        user = data["users"].get(user_id, {})
+        stats = user.get(quiz_type, {"total_money": 0, "highest_record": 0})
         return stats["total_money"], stats["highest_record"]
-    except Exception as e:
-        logger.error(
-            f"更新用户数据失败: {e}\n"
-            f"user_id={user_id}, quiz_type={quiz_type}, current_game_money={current_game_money}"
-        )
-        return 0, 0
 
 
-def get_user_stats(data_root: Path, user_id: str, quiz_type: str) -> Tuple[int, int]:
-    data = _load_user_data(data_root)
-    user = data["users"].get(user_id, {})
-    stats = user.get(quiz_type, {"total_money": 0, "highest_record": 0})
-    return stats["total_money"], stats["highest_record"]
-
-
-def get_user_all_stats(data_root: Path, user_id: str) -> Dict[str, Dict[str, int]]:
-    data = _load_user_data(data_root)
-    user_data = data["users"].get(user_id, {})
-    stats_dict = {}
-    for key, value in user_data.items():
-        if (
-            isinstance(value, dict)
-            and "total_money" in value
-            and "highest_record" in value
-        ):
-            stats_dict[key] = value
-    return stats_dict
-
-
-def get_all_users_stats(data_root: Path) -> Dict[str, Dict[str, Dict[str, int]]]:
-    data = _load_user_data(data_root)
-    all_stats = {}
-    for uid, user_data in data["users"].items():
+async def get_user_all_stats(
+    data_root: Path, user_id: str
+) -> Dict[str, Dict[str, int]]:
+    async with _user_data_lock:
+        data = await _load_user_data(data_root)
+        user_data = data["users"].get(user_id, {})
         stats_dict = {}
         for key, value in user_data.items():
             if (
@@ -372,9 +391,25 @@ def get_all_users_stats(data_root: Path) -> Dict[str, Dict[str, Dict[str, int]]]
                 and "highest_record" in value
             ):
                 stats_dict[key] = value
-        if stats_dict:
-            all_stats[uid] = stats_dict
-    return all_stats
+        return stats_dict
+
+
+async def get_all_users_stats(data_root: Path) -> Dict[str, Dict[str, Dict[str, int]]]:
+    async with _user_data_lock:
+        data = await _load_user_data(data_root)
+        all_stats = {}
+        for uid, user_data in data["users"].items():
+            stats_dict = {}
+            for key, value in user_data.items():
+                if (
+                    isinstance(value, dict)
+                    and "total_money" in value
+                    and "highest_record" in value
+                ):
+                    stats_dict[key] = value
+            if stats_dict:
+                all_stats[uid] = stats_dict
+        return all_stats
 
 
 def list_available_quizzes(data_root: Path, validate_content: bool = False):
@@ -426,6 +461,93 @@ def get_available_quiz_names(data_root: Path, validate_content: bool = False):
     return cleaned_names
 
 
+class QuizSession:
+    def __init__(
+        self,
+        questions: list,
+        data_dir: Path,
+        quiz_type: str,
+        user_id: str,
+        user_name: str,
+    ):
+        self.questions = questions
+        self.data_dir = data_dir
+        self.quiz_type = quiz_type
+        self.user_id = user_id
+        self.user_name = user_name
+        self.turn = 0
+        self.money = 0
+        self.chapter = 0
+
+    async def send_question(
+        self, event: AstrMessageEvent, controller: Optional[SessionController] = None
+    ):
+        """发送当前题目，若 controller 不为 None 则调用 keep"""
+        q = self.questions[self.turn]
+        options_text = "\n".join(q["options"])
+        text = f"第{self.turn + 1}题：{q['question']}\n{options_text}"
+        img_path = self.data_dir / f"{self.quiz_type}_quiz_images" / f"{q['id']}.png"
+        if img_path.exists():
+            await event.send(
+                event.chain_result(
+                    [Comp.Plain(text), Comp.Image.fromFileSystem(str(img_path))]
+                )
+            )
+        else:
+            await event.send(event.plain_result(text))
+        if controller:
+            controller.keep(timeout=15, reset_timeout=True)
+        self.chapter = 0
+
+    async def handle_answer(
+        self, event: AstrMessageEvent, controller: SessionController
+    ) -> bool:
+        answer = event.message_str.strip()
+        if self.chapter == 1:
+            if answer in ("退出", "quit"):
+                await self._end_game(controller, event, exit_normally=True)
+                return True
+            else:
+                await self.send_question(event, controller)
+                return False
+        else:
+            if answer.upper() == str(self.questions[self.turn]["correct"]).upper():
+                self.money += 50 * (self.turn + 1)
+                self.turn += 1
+                if self.turn == 10:
+                    await self._end_game(controller, event, all_correct=True)
+                    return True
+                else:
+                    await event.send(
+                        event.plain_result(
+                            f"奖池里面已经有{self.money}元，还要继续吗？可以输入“退出”或“quit”来带走已经获得的奖金，除此以外任何输入都视作继续挑战！"
+                        )
+                    )
+                    self.chapter = 1
+                    controller.keep(timeout=15, reset_timeout=True)
+                    return False
+            else:
+                await self._end_game(controller, event, wrong=True)
+                return True
+
+    async def _end_game(
+        self, controller: SessionController, event: AstrMessageEvent, **kwargs
+    ):
+        """结束游戏并更新用户数据"""
+        final_money = self.money if not kwargs.get("wrong") else 0
+        new_total, new_highest = await update_user_money(
+            self.data_dir, self.user_id, self.user_name, self.quiz_type, final_money
+        )
+        if kwargs.get("all_correct"):
+            msg = f"挑战成功！获得全部奖金，奖池有{final_money}元！\n该类型累计总奖金：{new_total} 元，{self.quiz_type} 类型最高纪录：{new_highest} 元。"
+        elif kwargs.get("wrong"):
+            msg = f"回答错误!本次挑战结束，一共回答正确了{self.turn}个问题，奖池{final_money}元已经清零。\n您的该类型累计总奖金：{new_total} 元，{self.quiz_type} 类型最高纪录：{new_highest} 元。再接再厉！"
+        else:  # 正常退出
+            msg = f"游戏结束，恭喜您本次挑战获得{final_money}元奖金。\n该类型题目累计总奖金：{new_total} 元，{self.quiz_type} 类型最高纪录：{new_highest} 元。"
+        await event.send(event.plain_result(msg))
+        controller.stop()
+
+
 @register("Quiz", "cyh-x", "一个基于FoxQuiz网站的知识问答插件", "1.0.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
@@ -443,12 +565,8 @@ class MyPlugin(Star):
         """输入/quiz [题目类型]来开始问答"""
         user_name = event.get_sender_name()
         user_id = event.get_sender_id()
-        quiz_turn = 0
-        money = 0
-        chapter = 0
-
         file_path = self.data_dir / f"{type_of_quiz}_quiz.json"
-        total_money, highest_record = get_user_stats(
+        total_money, highest_record = await get_user_stats(
             self.data_dir, user_id, type_of_quiz
         )
 
@@ -463,132 +581,43 @@ class MyPlugin(Star):
             yield event.plain_result(
                 f"题库文件不存在：{file_path}。请确认是否下载了该题库，或者尝试使用unload删除题库后重新下载"
             )
-            logger.error(f"题库文件不存在：{file_path}")
             return
         except json.JSONDecodeError:
             yield event.plain_result(
                 "题库文件格式错误，请检查 JSON 格式。或者尝试使用unload删除题库后重新下载"
             )
-            logger.error(f"题库文件格式错误")
+            return
+        except (OSError, RuntimeError) as e:  # 新增：文件读取错误
+            yield event.plain_result(f"读取题库文件失败：{e}")
+            return
+        except ValueError as e:  # 新增：内容结构错误
+            yield event.plain_result(f"题库内容无效：{e}")
+            return
+        except Exception as e:  # 兜底
+            yield event.plain_result(f"加载题库时发生未知错误：{e}")
             return
 
-        if not random_questions:
-            yield event.plain_result("题库为空。")
-            return
-
-        # 发送第一题
-        img_path = (
-            self.data_dir
-            / f"{type_of_quiz}_quiz_images"
-            / f"{random_questions[0]['id']}.png"
+        session = QuizSession(
+            random_questions, self.data_dir, type_of_quiz, user_id, user_name
         )
-        text_content = f"请在15秒内回答第1题：{random_questions[0]['question']}\n{random_questions[0]['options']}"
-        if img_path.exists():
-            chain = [Comp.Plain(text_content), Comp.Image.fromFileSystem(str(img_path))]
-            yield event.chain_result(chain)
-        else:
-            logger.warning(f"图片不存在: {img_path}")
-            yield event.plain_result(text_content)
+
+        # 发送第一题（此时没有 controller）
+        await session.send_question(event, controller=None)
 
         @session_waiter(timeout=15, record_history_chains=False)
-        async def empty_mention_waiter(
-            controller: SessionController, event: AstrMessageEvent
-        ):
-            if not event.message_str or event.message_str.strip() == "":
-                logger.debug("收到空消息，忽略并继续等待")
-                controller.keep(timeout=15, reset_timeout=True)  # 继续等待
-                return
-            nonlocal quiz_turn, money, chapter
-            current_q = random_questions[quiz_turn]
-            answer = event.message_str
+        async def handler(controller: SessionController, event: AstrMessageEvent):
+            done = await session.handle_answer(event, controller)
+            if done:
+                controller.stop()
+            # 如果未结束，会话继续（内部已经调用 controller.keep 或已经通过 send_question 调用了 keep）
 
-            if chapter == 1:
-                if answer == "退出" or answer == "quit":
-                    new_total, new_highest = update_user_money(
-                        self.data_dir, user_id, user_name, type_of_quiz, money
-                    )
-                    await event.send(
-                        event.plain_result(
-                            f"游戏结束，恭喜您本次挑战获得{money}元奖金。\n"
-                            f"该类型题目累计总奖金：{new_total} 元，{type_of_quiz} 类型最高纪录：{new_highest} 元。"
-                        )
-                    )
-                    controller.stop()
-                    return
-                else:
-                    # 发送下一题
-                    try:
-                        next_q = random_questions[quiz_turn]
-                        text_content = f"第{quiz_turn + 1}题：{next_q['question']}\n{next_q['options']}"
-                        img_path = (
-                            self.data_dir
-                            / f"{type_of_quiz}_quiz_images"
-                            / f"{next_q['id']}.png"
-                        )
-                        if img_path.exists():
-                            chain = [
-                                Comp.Plain(text_content),
-                                Comp.Image.fromFileSystem(str(img_path)),
-                            ]
-                            await event.send(event.chain_result(chain))
-                        else:
-                            logger.warning(f"图片不存在: {img_path}")
-                            await event.send(event.plain_result(text_content))
-                        controller.keep(timeout=15, reset_timeout=True)
-                        chapter = 0
-                        return
-                    except Exception as e:
-                        logger.error(f"发送题目时出错: {e}")
-                        await event.send(f"发送题目失败，请稍后重试。")
-            else:
-                if answer.strip().upper() == str(current_q["correct"]).upper():
-                    money += 50 * (quiz_turn + 1)
-                    quiz_turn += 1
-
-                    if quiz_turn == 10:
-                        new_total, new_highest = update_user_money(
-                            self.data_dir, user_id, user_name, type_of_quiz, money
-                        )
-                        await event.send(
-                            event.plain_result(
-                                f"挑战成功！获得全部奖金，奖池有{money}元！\n"
-                                f"该类型累计总奖金：{new_total} 元，{type_of_quiz} 类型最高纪录：{new_highest} 元。"
-                            )
-                        )
-                        chapter = 0
-                        controller.stop()
-                        return
-                    else:
-                        await event.send(
-                            event.plain_result(
-                                f"奖池里面已经有{money}元，还要继续吗？可以输入“退出”或“quit”来带走已经获得的奖金，除此以外任何输入都视作继续挑战！"
-                            )
-                        )
-                        controller.keep(timeout=15, reset_timeout=True)
-                        chapter = 1
-                        return
-                else:
-                    money = 0
-                    new_total, new_highest = update_user_money(
-                        self.data_dir, user_id, user_name, type_of_quiz, money
-                    )
-                    await event.send(
-                        event.plain_result(
-                            f"回答错误!本次挑战结束，一共回答正确了{quiz_turn}个问题，奖池{money}元已经清零。\n"
-                            f"您的该类型累计总奖金：{new_total} 元，{type_of_quiz} 类型最高纪录：{new_highest} 元。再接再厉！"
-                        )
-                    )
-                    chapter = 0
-                    controller.stop()
-                    return
-
-        chapter = 0
         try:
-            await empty_mention_waiter(event)
-        except TimeoutError:
-            money = 0
-            new_total, new_highest = update_user_money(
-                self.data_dir, user_id, user_name, type_of_quiz, money
+            await handler(event)
+        except (TimeoutError, asyncio.TimeoutError):
+            # 超时处理，注意 session 中有当前奖金，但超时后奖金清零
+            final_money = 0
+            new_total, new_highest = await update_user_money(
+                self.data_dir, user_id, user_name, type_of_quiz, final_money
             )
             yield event.plain_result(
                 f"你超时了！本次挑战结束，本次奖金已经清零。\n"
@@ -596,6 +625,7 @@ class MyPlugin(Star):
             )
         except Exception as e:
             yield event.plain_result("发生错误，请联系管理员: " + str(e))
+
         finally:
             event.stop_event()
 
@@ -673,30 +703,30 @@ class MyPlugin(Star):
             user_id = event.get_sender_id()
             user_name = event.get_sender_name()
 
-        all_stats = get_user_all_stats(self.data_dir, user_id)
+        all_stats = await get_user_all_stats(self.data_dir, user_id)
 
         if not all_stats:
             yield event.plain_result(f"用户 {user_name} 暂无任何游戏记录。")
             return
 
-        lines = [f"📊 用户：{user_name} 的问答统计", "=" * 30]
+        lines = [f"📊 用户：{user_name} 的问答统计", "=" * 20]
         for quiz_type, stats in all_stats.items():
             lines.append(f"【{quiz_type}】")
             lines.append(f"  累计奖金：{stats['total_money']} 元")
             lines.append(f"  最高纪录：{stats['highest_record']} 元")
             lines.append("-" * 20)
+        total_all = sum(stats["total_money"] for stats in all_stats.values())
+        lines.append(f"总奖金{total_all}元")
         if lines[-1] == "-" * 20:
             lines.pop()
         result = "\n".join(lines)
-        total_all = sum(stats["total_money"] for stats in all_stats.values())
-
-        yield event.plain_result(result)
-        yield event.plain_result(f"总奖金{total_all}元")
+        yield event.plain_result(f"{result}")
+        # yield event.plain_result(f"总奖金{total_all}元")
 
     @quiz_stats.command("rank")
     async def user_rank(self, event: AstrMessageEvent, quiz_type: str = "all"):
         """查询用户排行榜"""
-        users = get_all_users_stats(self.data_dir)
+        users = await get_all_users_stats(self.data_dir)
         if not users:
             yield event.plain_result("暂无用户数据。")
             return
@@ -730,7 +760,10 @@ class MyPlugin(Star):
     async def quiz_list(self, event: AstrMessageEvent):
         """列出所有已下载并保存的可用测验题库"""
         names = get_available_quiz_names(self.data_dir, validate_content=False)
-        yield event.plain_result(f"可用题库如下{names}")
+        if names:
+            yield event.plain_result("可用题库：\n" + "\n".join(names))
+        else:
+            yield event.plain_result("暂无可用题库。")
 
     async def terminate(self):
         """插件销毁时调用"""
