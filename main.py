@@ -578,7 +578,7 @@ class QuizSession:
         controller.stop()
 
 
-@register("Quiz", "cyh-x", "一个基于FoxQuiz网站的知识问答插件", "1.0.0")
+@register("Quiz", "cyh-x", "一个基于FoxQuiz网站的知识问答插件", "1.1.0")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
