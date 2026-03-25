@@ -479,25 +479,40 @@ class QuizSession:
         self.money = 0
         self.chapter = 0
 
-    async def send_question(
-        self, event: AstrMessageEvent, controller: Optional[SessionController] = None
-    ):
-        """发送当前题目，若 controller 不为 None 则调用 keep"""
+    async def send_question(self, event: AstrMessageEvent, controller: Optional[SessionController] = None) -> bool:
+        """发送当前题目。返回 True 表示至少有一种形式发送成功，False 表示完全失败（此时游戏应结束）"""
         q = self.questions[self.turn]
-        options_text = "\n".join(q["options"])
-        text = f"第{self.turn + 1}题：{q['question']}\n{options_text}"
+        options_text = "\n".join(q['options'])
+        text = f"第{self.turn+1}题：{q['question']}\n{options_text}"
         img_path = self.data_dir / f"{self.quiz_type}_quiz_images" / f"{q['id']}.png"
+
+        sent = False
+        # 尝试发送带图片的消息
         if img_path.exists():
-            await event.send(
-                event.chain_result(
-                    [Comp.Plain(text), Comp.Image.fromFileSystem(str(img_path))]
-                )
-            )
-        else:
-            await event.send(event.plain_result(text))
+            try:
+                await event.send(event.chain_result([Comp.Plain(text), Comp.Image.fromFileSystem(str(img_path))]))
+                sent = True
+                logger.debug(f"题目发送成功（带图片）")
+            except Exception as e:
+                logger.warning(f"发送带图片题目失败: {e}，尝试发送纯文本")
+
+        # 若带图片发送失败或图片不存在，尝试仅发送文本
+        if not sent:
+            try:
+                await event.send(event.plain_result(text))
+                sent = True
+                logger.debug(f"题目发送成功（纯文本）")
+            except Exception as e:
+                logger.error(f"发送纯文本题目也失败: {e}")
+
+        if not sent:
+            # 完全失败，结束游戏
+            return False
+
         if controller:
             controller.keep(timeout=15, reset_timeout=True)
         self.chapter = 0
+        return True
 
     async def handle_answer(
         self, event: AstrMessageEvent, controller: SessionController
@@ -507,8 +522,16 @@ class QuizSession:
             if answer in ("退出", "quit"):
                 await self._end_game(controller, event, exit_normally=True)
                 return True
+            elif answer == "继续":
+                success = await self.send_question(event, controller)
+                if not success:
+                    await self._end_game(controller, event, send_failed=True)
+                    return True
+                return False
             else:
-                await self.send_question(event, controller)
+                # 无效输入，提示并继续等待
+                await event.send(event.plain_result("请输入“继续”继续挑战，或输入“退出”结束游戏。"))
+                controller.keep(timeout=15, reset_timeout=True)
                 return False
         else:
             if answer.upper() == str(self.questions[self.turn]["correct"]).upper():
@@ -518,11 +541,10 @@ class QuizSession:
                     await self._end_game(controller, event, all_correct=True)
                     return True
                 else:
-                    await event.send(
-                        event.plain_result(
-                            f"奖池里面已经有{self.money}元，还要继续吗？可以输入“退出”或“quit”来带走已经获得的奖金，除此以外任何输入都视作继续挑战！"
-                        )
-                    )
+                    await event.send(event.plain_result(
+                        f"奖池里面已经有{self.money}元，还要继续吗？你有15s时间考虑\n"
+                        f"输入“继续”继续挑战，输入“退出”或“quit”带走奖金。"
+                    ))
                     self.chapter = 1
                     controller.keep(timeout=15, reset_timeout=True)
                     return False
@@ -530,20 +552,28 @@ class QuizSession:
                 await self._end_game(controller, event, wrong=True)
                 return True
 
-    async def _end_game(
-        self, controller: SessionController, event: AstrMessageEvent, **kwargs
-    ):
+    async def _end_game(self, controller: SessionController, event: AstrMessageEvent, **kwargs):
         """结束游戏并更新用户数据"""
-        final_money = self.money if not kwargs.get("wrong") else 0
+        # 若因发送失败而结束，保留当前奖金
+        if kwargs.get("send_failed"):
+            final_money = self.money
+            msg = f"发送题目时出错，游戏被迫结束。您已获得的 {final_money} 元已计入总奖金。"
+        else:
+            final_money = self.money if not kwargs.get("wrong") else 0
+
         new_total, new_highest = await update_user_money(
             self.data_dir, self.user_id, self.user_name, self.quiz_type, final_money
         )
+
         if kwargs.get("all_correct"):
             msg = f"挑战成功！获得全部奖金，奖池有{final_money}元！\n该类型累计总奖金：{new_total} 元，{self.quiz_type} 类型最高纪录：{new_highest} 元。"
         elif kwargs.get("wrong"):
             msg = f"回答错误!本次挑战结束，一共回答正确了{self.turn}个问题，奖池{final_money}元已经清零。\n您的该类型累计总奖金：{new_total} 元，{self.quiz_type} 类型最高纪录：{new_highest} 元。再接再厉！"
+        elif kwargs.get("send_failed"):
+            msg = f"题目发送失败，游戏终止。您已获得 {final_money} 元奖金。\n该类型累计总奖金：{new_total} 元，{self.quiz_type} 类型最高纪录：{new_highest} 元。"
         else:  # 正常退出
             msg = f"游戏结束，恭喜您本次挑战获得{final_money}元奖金。\n该类型题目累计总奖金：{new_total} 元，{self.quiz_type} 类型最高纪录：{new_highest} 元。"
+
         await event.send(event.plain_result(msg))
         controller.stop()
 
@@ -717,8 +747,6 @@ class MyPlugin(Star):
             lines.append("-" * 20)
         total_all = sum(stats["total_money"] for stats in all_stats.values())
         lines.append(f"总奖金{total_all}元")
-        if lines[-1] == "-" * 20:
-            lines.pop()
         result = "\n".join(lines)
         yield event.plain_result(f"{result}")
         # yield event.plain_result(f"总奖金{total_all}元")
