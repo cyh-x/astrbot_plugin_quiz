@@ -16,7 +16,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 import urllib.parse
 import shutil
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, NamedTuple, List
 from pathlib import Path
 
 # 在文件顶部（例如 import 之后）添加
@@ -104,8 +104,8 @@ async def download_and_parse_quiz(
             text_p = opt.select_one("p.text-lg")
             option_text = text_p.get_text(strip=True) if text_p else ""
             options.append({"letter": letter, "text": option_text})
-            classes = opt.get("class", [])
-            if "bg-green-50" in classes and opt.select_one("svg.lucide-check"):
+            classes = opt.get("class", [])  # type: ignore
+            if "bg-green-50" in classes and opt.select_one("svg.lucide-check"):  # type: ignore
                 correct_letter = letter
 
         image_path = f"{number}.png"
@@ -127,6 +127,89 @@ async def download_and_parse_quiz(
 
 
 BASE_URL = "https://foxquiz.com"
+
+
+# 假设 BASE_URL 已在外部定义，这里补上
+BASE_URL = "https://foxquiz.com"
+
+
+class ImageInfo(NamedTuple):
+    """图片信息结构"""
+
+    number: str
+    url: str
+    filepath: Path
+
+
+def _extract_image_info(soup: BeautifulSoup, output_dir: Path) -> List[ImageInfo]:
+    """从解析后的HTML中提取所有图片信息"""
+    cards = soup.find_all(
+        "div",
+        class_="bg-white rounded-lg shadow-lg overflow-hidden border border-gray-200",
+    )
+    images_info = []
+    for card in cards:
+        # 提取序号
+        title_div = card.find("div", class_="p-6 bg-gray-50 border-b border-gray-200")
+        if not title_div:
+            continue
+        number_span = title_div.find(
+            "span",
+            class_=(
+                "inline-flex items-center justify-center w-8 h-8 mr-3 "
+                "rounded-full bg-gray-100 text-gray-700 text-sm font-semibold leading-none"
+            ),
+        )
+        if not number_span:
+            continue
+        number = number_span.get_text(strip=True)
+
+        # 提取图片元素
+        img_div = card.find(
+            "div",
+            class_=(
+                "relative w-full h-64 md:h-auto md:flex-1 md:min-h-[400px] "
+                "bg-gray-100 order-1 md:order-2 border-b md:border-b-0 md:border-l border-gray-200"
+            ),
+        )
+        if not img_div:
+            continue
+        img = img_div.find("img")
+        if not img:
+            continue
+
+        src = img.get("src")
+        if not src:
+            srcset = img.get("srcset")
+            if srcset:
+                src = srcset.split(",")[0].split()[0]  # type: ignore
+            else:
+                logger.info(f"跳过序号 {number}: 未找到图片URL")
+                continue
+
+        # 解析 Next.js 图片路径
+        parsed = urllib.parse.urlparse(src)  # type: ignore
+        if parsed.path == "/_next/image":
+            query_params = urllib.parse.parse_qs(parsed.query)
+            if "url" in query_params:
+                encoded_url = query_params["url"][0]
+                real_path = urllib.parse.unquote(encoded_url)
+            else:
+                logger.info(f"序号 {number}: 未找到url参数，跳过")
+                continue
+        else:
+            real_path = src
+
+        full_img_url = urllib.parse.urljoin(BASE_URL, real_path)  # type: ignore
+        ext = os.path.splitext(real_path)[1]  # type: ignore
+        if not ext:
+            ext = ".jpg"
+        filename = f"{number}{ext}"
+        filepath = output_dir / filename
+
+        images_info.append(ImageInfo(number, full_img_url, filepath))
+
+    return images_info
 
 
 async def _download_single_image(
@@ -151,6 +234,7 @@ async def download_images(
 ) -> None:
     """
     异步并发下载指定测验类型的所有图片。
+    下载完成后校验缺失文件，并自动重试一次。
     """
     html_file = data_dir / f"{quiz_type}_quiz.html"
     if output_dir is None:
@@ -181,85 +265,49 @@ async def download_images(
             raise
 
     soup = BeautifulSoup(html_content, "html.parser")
-    cards = soup.find_all(
-        "div",
-        class_="bg-white rounded-lg shadow-lg overflow-hidden border border-gray-200",
-    )
+    # 提取所有图片信息
+    images_info = _extract_image_info(soup, output_dir)
+    if not images_info:
+        logger.warning("未找到任何图片信息")
+        return
 
+    # 第一次下载：并发下载所有图片
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for card in cards:
-            # 提取序号
-            title_div = card.find(
-                "div", class_="p-6 bg-gray-50 border-b border-gray-200"
-            )
-            if not title_div:
+        for info in images_info:
+            # 如果文件已存在则跳过（避免重复下载）
+            if info.filepath.exists():
+                logger.info(f"图片 {info.filepath.name} 已存在，跳过")
                 continue
-            number_span = title_div.find(
-                "span",
-                class_=(
-                    "inline-flex items-center justify-center w-8 h-8 mr-3 "
-                    "rounded-full bg-gray-100 text-gray-700 text-sm font-semibold leading-none"
-                ),
-            )
-            if not number_span:
-                continue
-            number = number_span.get_text(strip=True)
-
-            # 提取图片元素
-            img_div = card.find(
-                "div",
-                class_=(
-                    "relative w-full h-64 md:h-auto md:flex-1 md:min-h-[400px] "
-                    "bg-gray-100 order-1 md:order-2 border-b md:border-b-0 md:border-l border-gray-200"
-                ),
-            )
-            if not img_div:
-                continue
-            img = img_div.find("img")
-            if not img:
-                continue
-
-            src = img.get("src")
-            if not src:
-                srcset = img.get("srcset")
-                if srcset:
-                    src = srcset.split(",")[0].split()[0]
-                else:
-                    logger.info(f"跳过序号 {number}: 未找到图片URL")
-                    continue
-
-            # 解析 Next.js 图片路径
-            parsed = urllib.parse.urlparse(src)
-            if parsed.path == "/_next/image":
-                query_params = urllib.parse.parse_qs(parsed.query)
-                if "url" in query_params:
-                    encoded_url = query_params["url"][0]
-                    real_path = urllib.parse.unquote(encoded_url)
-                else:
-                    logger.info(f"序号 {number}: 未找到url参数，跳过")
-                    continue
-            else:
-                real_path = src
-
-            full_img_url = urllib.parse.urljoin(BASE_URL, real_path)
-            ext = os.path.splitext(real_path)[1]
-            if not ext:
-                ext = ".jpg"
-            filename = f"{number}{ext}"
-            filepath = output_dir / filename
-
-            if filepath.exists():
-                logger.info(f"图片 {filename} 已存在，跳过")
-                continue
-
-            # 创建下载任务（协程），不立即 await
-            task = _download_single_image(session, full_img_url, filepath, headers)
+            task = _download_single_image(session, info.url, info.filepath, headers)
             tasks.append(task)
 
-        # 并发执行所有下载任务
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 校验：检查缺失的文件
+    missing = [info for info in images_info if not info.filepath.exists()]
+    if missing:
+        logger.warning(f"发现 {len(missing)} 个缺失文件，将重试下载一次")
+        # 重试下载缺失的文件（仅一次）
+        async with aiohttp.ClientSession() as session:
+            retry_tasks = [
+                _download_single_image(session, info.url, info.filepath, headers)
+                for info in missing
+            ]
+            if retry_tasks:
+                await asyncio.gather(*retry_tasks, return_exceptions=True)
+
+        # 再次检查
+        still_missing = [info for info in missing if not info.filepath.exists()]
+        if still_missing:
+            logger.error(
+                f"重试后仍有 {len(still_missing)} 个文件下载失败: {[info.filepath.name for info in still_missing]}"
+            )
+        else:
+            logger.info("所有缺失文件已成功重试下载")
+    else:
+        logger.info("所有图片下载完成")
 
 
 def extract_random_questions(json_file_path: Path, num: int = 10):
@@ -479,18 +527,24 @@ class QuizSession:
         self.money = 0
         self.chapter = 0
 
-    async def send_question(self, event: AstrMessageEvent, controller: Optional[SessionController] = None) -> bool:
+    async def send_question(
+        self, event: AstrMessageEvent, controller: Optional[SessionController] = None
+    ) -> bool:
         """发送当前题目。返回 True 表示至少有一种形式发送成功，False 表示完全失败（此时游戏应结束）"""
         q = self.questions[self.turn]
-        options_text = "\n".join(q['options'])
-        text = f"第{self.turn+1}题：{q['question']}\n{options_text}"
+        options_text = "\n".join(q["options"])
+        text = f"第{self.turn + 1}题：{q['question']}\n{options_text}"
         img_path = self.data_dir / f"{self.quiz_type}_quiz_images" / f"{q['id']}.png"
 
         sent = False
         # 尝试发送带图片的消息
         if img_path.exists():
             try:
-                await event.send(event.chain_result([Comp.Plain(text), Comp.Image.fromFileSystem(str(img_path))]))
+                await event.send(
+                    event.chain_result(
+                        [Comp.Plain(text), Comp.Image.fromFileSystem(str(img_path))]
+                    )
+                )
                 sent = True
                 logger.debug(f"题目发送成功（带图片）")
             except Exception as e:
@@ -530,7 +584,9 @@ class QuizSession:
                 return False
             else:
                 # 无效输入，提示并继续等待
-                await event.send(event.plain_result("请输入“继续”继续挑战，或输入“退出”结束游戏。"))
+                await event.send(
+                    event.plain_result("请输入“继续”继续挑战，或输入“退出”结束游戏。")
+                )
                 controller.keep(timeout=15, reset_timeout=True)
                 return False
         else:
@@ -541,10 +597,12 @@ class QuizSession:
                     await self._end_game(controller, event, all_correct=True)
                     return True
                 else:
-                    await event.send(event.plain_result(
-                        f"奖池里面已经有{self.money}元，还要继续吗？你有15s时间考虑\n"
-                        f"输入“继续”继续挑战，输入“退出”或“quit”带走奖金。"
-                    ))
+                    await event.send(
+                        event.plain_result(
+                            f"奖池里面已经有{self.money}元，还要继续吗？你有15s时间考虑\n"
+                            f"输入“继续”继续挑战，输入“退出”或“quit”带走奖金。"
+                        )
+                    )
                     self.chapter = 1
                     controller.keep(timeout=15, reset_timeout=True)
                     return False
@@ -552,7 +610,9 @@ class QuizSession:
                 await self._end_game(controller, event, wrong=True)
                 return True
 
-    async def _end_game(self, controller: SessionController, event: AstrMessageEvent, **kwargs):
+    async def _end_game(
+        self, controller: SessionController, event: AstrMessageEvent, **kwargs
+    ):
         """结束游戏并更新用户数据"""
         # 若因发送失败而结束，保留当前奖金
         if kwargs.get("send_failed"):
@@ -578,7 +638,7 @@ class QuizSession:
         controller.stop()
 
 
-@register("Quiz", "cyh-x", "一个基于FoxQuiz网站的知识问答插件", "1.1.0")
+@register("Quiz", "cyh-x", "一个基于FoxQuiz网站的知识问答插件", "1.1.1")
 class MyPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -636,9 +696,12 @@ class MyPlugin(Star):
 
         @session_waiter(timeout=15, record_history_chains=False)
         async def handler(controller: SessionController, event: AstrMessageEvent):
-            done = await session.handle_answer(event, controller)
-            if done:
-                controller.stop()
+            if event.get_sender_id() != user_id:
+                return
+            else:
+                done = await session.handle_answer(event, controller)
+                if done:
+                    controller.stop()
             # 如果未结束，会话继续（内部已经调用 controller.keep 或已经通过 send_question 调用了 keep）
 
         try:
@@ -724,7 +787,7 @@ class MyPlugin(Star):
         pass
 
     @quiz_stats.command("get")
-    async def user_stats(self, event: AstrMessageEvent, target: str = None):
+    async def user_stats(self, event: AstrMessageEvent, target: str = None):  # type: ignore
         """查询用户统计信息"""
         if target:
             user_id = target
