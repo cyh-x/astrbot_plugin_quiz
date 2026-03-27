@@ -129,8 +129,6 @@ async def download_and_parse_quiz(
 BASE_URL = "https://foxquiz.com"
 
 
-# 假设 BASE_URL 已在外部定义，这里补上
-BASE_URL = "https://foxquiz.com"
 
 
 class ImageInfo(NamedTuple):
@@ -149,7 +147,7 @@ def _extract_image_info(soup: BeautifulSoup, output_dir: Path) -> List[ImageInfo
     )
     images_info = []
     for card in cards:
-        # 提取序号
+        # 提取序号（与原逻辑相同）
         title_div = card.find("div", class_="p-6 bg-gray-50 border-b border-gray-200")
         if not title_div:
             continue
@@ -178,30 +176,31 @@ def _extract_image_info(soup: BeautifulSoup, output_dir: Path) -> List[ImageInfo
         if not img:
             continue
 
+        # ---------- 关键修改：仿照示例代码处理 Next.js 代理 URL ----------
         src = img.get("src")
         if not src:
             srcset = img.get("srcset")
             if srcset:
-                src = srcset.split(",")[0].split()[0]  # type: ignore
-            else:
-                logger.info(f"跳过序号 {number}: 未找到图片URL")
-                continue
-
-        # 解析 Next.js 图片路径
-        parsed = urllib.parse.urlparse(src)  # type: ignore
-        if parsed.path == "/_next/image":
+                src = srcset.split(",")[0].strip().split(" ")[0]  # type: ignore # 取第一个 URL
+        # 解析真实路径
+        real_path = None
+        if src and "/_next/image" in src:
+            parsed = urllib.parse.urlparse(src) # type: ignore
             query_params = urllib.parse.parse_qs(parsed.query)
             if "url" in query_params:
                 encoded_url = query_params["url"][0]
                 real_path = urllib.parse.unquote(encoded_url)
-            else:
-                logger.info(f"序号 {number}: 未找到url参数，跳过")
-                continue
-        else:
+        elif src:
             real_path = src
 
-        full_img_url = urllib.parse.urljoin(BASE_URL, real_path)  # type: ignore
-        ext = os.path.splitext(real_path)[1]  # type: ignore
+        if not real_path:
+            logger.info(f"跳过序号 {number}: 无法解析图片URL")
+            continue
+
+        full_img_url = urllib.parse.urljoin(BASE_URL, real_path) # type: ignore
+        # ---------------------------------------------------------------
+
+        ext = os.path.splitext(real_path)[1] # type: ignore
         if not ext:
             ext = ".jpg"
         filename = f"{number}{ext}"
@@ -354,12 +353,13 @@ def extract_random_questions(json_file_path: Path, num: int = 10):
         result.append(
             {
                 "id": q.get("id", 0),
+                "number": q.get("number", str(q.get("id", 0))),  # 新增
                 "question": q.get("question", ""),
                 "options": option_strings,
                 "correct": q["correct_letter"],
                 "image": q.get("image", ""),
             }
-        )
+)
     return result
 
 
@@ -517,6 +517,7 @@ class QuizSession:
         quiz_type: str,
         user_id: str,
         user_name: str,
+        image_paths: Optional[Dict[str, Path]] = None,
     ):
         self.questions = questions
         self.data_dir = data_dir
@@ -526,47 +527,35 @@ class QuizSession:
         self.turn = 0
         self.money = 0
         self.chapter = 0
+        self.image_paths = image_paths or {}  # 存储 id -> 图片路径
 
-    async def send_question(
-        self, event: AstrMessageEvent, controller: Optional[SessionController] = None
-    ) -> bool:
-        """发送当前题目。返回 True 表示至少有一种形式发送成功，False 表示完全失败（此时游戏应结束）"""
+    async def send_question(self, event, controller=None) -> bool:
         q = self.questions[self.turn]
         options_text = "\n".join(q["options"])
         text = f"第{self.turn + 1}题：{q['question']}\n{options_text}"
-        img_path = self.data_dir / f"{self.quiz_type}_quiz_images" / f"{q['id']}.png"
 
-        sent = False
-        # 尝试发送带图片的消息
-        if img_path.exists():
-            try:
-                await event.send(
-                    event.chain_result(
-                        [Comp.Plain(text), Comp.Image.fromFileSystem(str(img_path))]
-                    )
+        # 使用题目 number 字段获取图片路径（number 与文件名一致）
+        img_path = self.image_paths.get(q["number"]) if self.image_paths else None
+        if not img_path or not img_path.exists():
+            logger.error(f"图片文件不存在或未配置: {q['number']}")
+            return False  # 无法发送图片，游戏应结束
+
+        try:
+            await event.send(
+                event.chain_result(
+                    [Comp.Plain(text), Comp.Image.fromFileSystem(str(img_path))]
                 )
-                sent = True
-                logger.debug(f"题目发送成功（带图片）")
-            except Exception as e:
-                logger.warning(f"发送带图片题目失败: {e}，尝试发送纯文本")
-
-        # 若带图片发送失败或图片不存在，尝试仅发送文本
-        if not sent:
-            try:
-                await event.send(event.plain_result(text))
-                sent = True
-                logger.debug(f"题目发送成功（纯文本）")
-            except Exception as e:
-                logger.error(f"发送纯文本题目也失败: {e}")
-
-        if not sent:
-            # 完全失败，结束游戏
+            )
+            logger.debug("题目发送成功（带图片）")
+            if controller:
+                controller.keep(timeout=15, reset_timeout=True)
+            self.chapter = 0
+            return True
+        except Exception as e:
+            logger.error(f"发送题目失败: {e}")
             return False
 
-        if controller:
-            controller.keep(timeout=15, reset_timeout=True)
-        self.chapter = 0
-        return True
+
 
     async def handle_answer(
         self, event: AstrMessageEvent, controller: SessionController
@@ -599,8 +588,8 @@ class QuizSession:
                 else:
                     await event.send(
                         event.plain_result(
-                            f"奖池里面已经有{self.money}元，还要继续吗？你有15s时间考虑\n"
-                            f"输入“继续”继续挑战，输入“退出”或“quit”带走奖金。"
+                            f"奖池里面已经有{self.money}分，还要继续吗？你有15s时间考虑\n"
+                            f"输入“继续”继续挑战，输入“退出”或“quit”带走。"
                         )
                     )
                     self.chapter = 1
@@ -687,13 +676,30 @@ class MyPlugin(Star):
             yield event.plain_result(f"加载题库时发生未知错误：{e}")
             return
 
+
+        images_dir = self.data_dir / f"{type_of_quiz}_quiz_images"
+        image_paths = {}
+        if images_dir.exists():
+            for img_file in images_dir.iterdir():
+                if img_file.is_file():
+                    stem = img_file.stem          # 文件名不含扩展名，如 "76"
+                    image_paths[stem] = img_file
+
         session = QuizSession(
-            random_questions, self.data_dir, type_of_quiz, user_id, user_name
+            questions=random_questions,
+            data_dir=self.data_dir,
+            quiz_type=type_of_quiz,
+            user_id=user_id,
+            user_name=user_name,
+            image_paths=image_paths   # 传入映射
         )
 
         # 发送第一题（此时没有 controller）
-        await session.send_question(event, controller=None)
-
+        # 发送第一题，并检查结果
+        success = await session.send_question(event, controller=None)
+        if not success:
+            await event.send(event.plain_result("题目发送失败，游戏终止。"))
+            return  # 不启动 handler
         @session_waiter(timeout=15, record_history_chains=False)
         async def handler(controller: SessionController, event: AstrMessageEvent):
             if event.get_sender_id() != user_id:
