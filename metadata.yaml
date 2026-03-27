@@ -1,7 +1,7 @@
 name: astrbot_plugin_quiz
 display_name: Quiz
 desc: 一个基于FoxQuiz网站的知识问答插件
-version: 1.1.1
+version: 1.1.2
 author: cyh-x
 repo: https://github.com/cyh-x/astrbot_plugin_quiz
 astrbot_version: ">=4.0.0"
